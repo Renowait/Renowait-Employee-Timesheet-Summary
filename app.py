@@ -8,7 +8,7 @@ import os
 import time
 from datetime import datetime
 from dotenv import load_dotenv
-from googleapiclient.errors import HttpError  # เพิ่มการนำเข้า HttpError
+from googleapiclient.errors import HttpError
 
 # โหลด environment variables
 load_dotenv()
@@ -87,23 +87,26 @@ def get_employee_data(service):
     print(f"Combined data: {combined_data}")
     return combined_data
 
-# อัปโหลดไฟล์รวมไปยัง Google Drive (แก้ไขให้จัดการ 404)
 def upload_combined_file(service, df):
     combined_file = 'combined_timesheet.csv'
     
     try:
         with open(combined_file, 'w', encoding='utf-8') as f:
             df.to_csv(f, index=False)
+        print(f"Created temporary file: {combined_file}")
         
+        # ตรวจสอบไฟล์ที่มีอยู่
         try:
             existing_files = service.files().list(
                 q=f"'{CENTRAL_FOLDER_ID}' in parents and name='combined_timesheet.csv'",
                 fields="files(id, name)"
             ).execute().get('files', [])
+            print(f"Existing files in Central folder: {existing_files}")
         except Exception as e:
             print(f"Error checking existing files in Central folder: {str(e)}")
-            raise
+            return False  # ไม่ raise เพื่อให้ดำเนินการต่อได้
         
+        # ลบไฟล์เก่าถ้ามี
         if existing_files:
             for file in existing_files:
                 print(f"Attempting to delete existing file: {file['name']} (ID: {file['id']})")
@@ -115,8 +118,9 @@ def upload_combined_file(service, df):
                         print(f"File {file['name']} (ID: {file['id']}) not found, skipping deletion")
                     else:
                         print(f"Error deleting file {file['name']}: {str(e)}")
-                        raise
+                        return False
         
+        # อัปโหลดไฟล์ใหม่
         print("Creating new combined_timesheet.csv")
         try:
             file_metadata = {
@@ -126,9 +130,13 @@ def upload_combined_file(service, df):
             media = MediaFileUpload(combined_file, mimetype='text/csv')
             service.files().create(body=file_metadata, media_body=media, fields='id').execute()
             print("Successfully uploaded combined_timesheet.csv")
+            return True
         except Exception as e:
             print(f"Error creating new combined_timesheet.csv: {str(e)}")
-            raise
+            return False
+    except Exception as e:
+        print(f"Error in upload_combined_file: {str(e)}")
+        return False
     finally:
         max_attempts = 5
         for attempt in range(max_attempts):
@@ -164,6 +172,7 @@ def dashboard():
         service = get_drive_service()
         raw_data = get_employee_data(service)
         message = "No data available"
+        table_html = "<p>No data available</p>"
         
         employee_filter = request.args.get('employee', default=None)
         
@@ -172,14 +181,12 @@ def dashboard():
             if employee_filter:
                 filtered_data = raw_data[raw_data['Employee'].str.contains(employee_filter, case=False, na=False)]
             
-            upload_combined_file(service, filtered_data)
+            upload_success = upload_combined_file(service, filtered_data)
             summary = summarize_data(filtered_data)
             summary = summary[['Employee', 'Date', 'Late', 'Leave', 'WFH', 'WFO']]
             table_html = summary.to_html(classes='table table-striped table-bordered table-hover', index=False)
-            message = "Data updated successfully"
+            message = "Data updated successfully" if upload_success else "Data processed but upload failed"
             summary.to_csv('summary_for_download.csv', index=False)
-        else:
-            table_html = "<p>No data available</p>"
     except Exception as e:
         table_html = f"<p>Error: {str(e)}</p>"
         message = f"Error: {str(e)}"
@@ -211,7 +218,7 @@ def download_csv():
                     print(f"Successfully deleted temporary summary file: summary_for_download.csv")
                     break
                 except Exception as e:
-                    print(f"Attempt {attempt + 1}/{max_attempts} - Error deleting temporary summary file: {str(e)}")
+                    print(f"Attempt {attempt + 1}/{max_attempts} - Error deleting temporary file: {str(e)}")
                     if attempt < max_attempts - 1:
                         time.sleep(1)
 
