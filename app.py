@@ -234,4 +234,5 @@ if __name__ == '__main__':
 else:
     import gunicorn
     port = int(os.getenv('PORT', 5000))
-    print(f"Gunicorn detected, binding to port {port}")
+    print(f"Gunicorn detected, attempting to bind to port {port}")
+    # Gunicorn จะถูกควบคุมโดย Procfile แต่เพิ่ม log เพื่อ debug
