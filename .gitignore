@@ -3,3 +3,4 @@
 __pycache__/
 combined_timesheet.csv
 summary_for_download.csv
+credentials.json
