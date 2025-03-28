@@ -8,6 +8,7 @@ import os
 import time
 from datetime import datetime
 from dotenv import load_dotenv
+from googleapiclient.errors import HttpError  # เพิ่มการนำเข้า HttpError
 
 # โหลด environment variables
 load_dotenv()
@@ -22,7 +23,6 @@ CENTRAL_FOLDER_ID = os.getenv('CENTRAL_FOLDER_ID', '1Mvanpcj2-wsd2eeObHMthqVHjmq
 
 def get_drive_service():
     try:
-        # อ่าน credentials จากไฟล์ที่ระบุใน GOOGLE_CREDENTIALS_PATH
         credentials = service_account.Credentials.from_service_account_file(
             SERVICE_ACCOUNT_FILE, scopes=SCOPES)
         service = build('drive', 'v3', credentials=credentials)
@@ -32,7 +32,6 @@ def get_drive_service():
         print(f"Error connecting to Google Drive API: {str(e)}")
         raise
 
-# ดึงข้อมูลจาก Google Drive
 def get_employee_data(service):
     print(f"Fetching folders from root folder ID: {ROOT_FOLDER_ID}")
     try:
@@ -88,7 +87,7 @@ def get_employee_data(service):
     print(f"Combined data: {combined_data}")
     return combined_data
 
-# อัปโหลดไฟล์รวมไปยัง Google Drive (สร้างใหม่ทุกครั้ง)
+# อัปโหลดไฟล์รวมไปยัง Google Drive (แก้ไขให้จัดการ 404)
 def upload_combined_file(service, df):
     combined_file = 'combined_timesheet.csv'
     
@@ -107,12 +106,16 @@ def upload_combined_file(service, df):
         
         if existing_files:
             for file in existing_files:
-                print(f"Deleting existing file: {file['name']} (ID: {file['id']})")
+                print(f"Attempting to delete existing file: {file['name']} (ID: {file['id']})")
                 try:
                     service.files().delete(fileId=file['id']).execute()
-                except Exception as e:
-                    print(f"Error deleting file {file['name']}: {str(e)}")
-                    raise
+                    print(f"Deleted existing file: {file['name']}")
+                except HttpError as e:
+                    if e.resp.status == 404:
+                        print(f"File {file['name']} (ID: {file['id']}) not found, skipping deletion")
+                    else:
+                        print(f"Error deleting file {file['name']}: {str(e)}")
+                        raise
         
         print("Creating new combined_timesheet.csv")
         try:
@@ -122,6 +125,7 @@ def upload_combined_file(service, df):
             }
             media = MediaFileUpload(combined_file, mimetype='text/csv')
             service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+            print("Successfully uploaded combined_timesheet.csv")
         except Exception as e:
             print(f"Error creating new combined_timesheet.csv: {str(e)}")
             raise
@@ -138,33 +142,20 @@ def upload_combined_file(service, df):
                 if attempt < max_attempts - 1:
                     time.sleep(1)
 
-# สรุปข้อมูล
 def summarize_data(df):
     if df.empty:
         return pd.DataFrame()
     
-    # เปลี่ยนรูปแบบวันที่ให้อ่านง่าย (เช่น จาก "2025-03-17" เป็น "17 Mar 2025")
     df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%d %b %Y')
-    
-    # สรุปข้อมูลโดยใช้ groupby และ unstack
     summary = df.groupby(['Employee', 'Date', 'Status']).size().unstack(fill_value=0)
-    
-    # ตรวจสอบและเพิ่มคอลัมน์ที่จำเป็นถ้าขาด
     required_columns = ['Late', 'Leave', 'WFH', 'WFO']
     for col in required_columns:
         if col not in summary.columns:
             summary[col] = 0
-    
-    # เรียงลำดับคอลัมน์ให้แน่นอน
     summary = summary[required_columns]
-    
-    # รีเซ็ต index เพื่อให้ Employee และ Date กลายเป็นคอลัมน์ปกติ
     summary = summary.reset_index()
-    
-    # Debug: แสดงชื่อคอลัมน์ที่ได้
     print("Summary columns:", summary.columns.tolist())
     print("Summary data:\n", summary)
-    
     return summary
 
 @app.route('/', methods=['GET'])
@@ -174,25 +165,18 @@ def dashboard():
         raw_data = get_employee_data(service)
         message = "No data available"
         
-        # รับค่าจากฟอร์ม (กรองตามชื่อพนักงาน)
         employee_filter = request.args.get('employee', default=None)
         
         if not raw_data.empty:
-            # กรองข้อมูลตามชื่อพนักงาน (ถ้ามี)
             filtered_data = raw_data
             if employee_filter:
                 filtered_data = raw_data[raw_data['Employee'].str.contains(employee_filter, case=False, na=False)]
             
-            # อัปโหลดข้อมูลที่กรองแล้ว
             upload_combined_file(service, filtered_data)
             summary = summarize_data(filtered_data)
-            
-            # ตรวจสอบให้แน่ใจว่าเรียงคอลัมน์ถูกต้อง
             summary = summary[['Employee', 'Date', 'Late', 'Leave', 'WFH', 'WFO']]
             table_html = summary.to_html(classes='table table-striped table-bordered table-hover', index=False)
             message = "Data updated successfully"
-            
-            # บันทึก summary ลงในไฟล์เพื่อใช้ในการดาวน์โหลด
             summary.to_csv('summary_for_download.csv', index=False)
         else:
             table_html = "<p>No data available</p>"
@@ -206,7 +190,6 @@ def dashboard():
 @app.route('/download', methods=['GET'])
 def download_csv():
     try:
-        # อ่านไฟล์ summary ที่บันทึกไว้
         if os.path.exists('summary_for_download.csv'):
             return send_file(
                 'summary_for_download.csv',
@@ -220,7 +203,6 @@ def download_csv():
         print(f"Error in download_csv: {str(e)}")
         return f"Error: {str(e)}", 500
     finally:
-        # ลบไฟล์หลังจากดาวน์โหลด
         if os.path.exists('summary_for_download.csv'):
             max_attempts = 5
             for attempt in range(max_attempts):
@@ -234,9 +216,7 @@ def download_csv():
                         time.sleep(1)
 
 if __name__ == '__main__':
-    # สำหรับ development
     port = int(os.getenv('PORT', 5000))
     app.run(debug=False, host='0.0.0.0', port=port)
 else:
-    # สำหรับ production (เช่น บน Render)
     import gunicorn
