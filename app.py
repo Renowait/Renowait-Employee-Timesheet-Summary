@@ -8,6 +8,7 @@ import os
 import time
 from datetime import datetime
 from dotenv import load_dotenv
+import json
 
 # โหลด environment variables
 load_dotenv()
@@ -22,8 +23,17 @@ CENTRAL_FOLDER_ID = os.getenv('CENTRAL_FOLDER_ID', '1Mvanpcj2-wsd2eeObHMthqVHjmq
 
 def get_drive_service():
     try:
-        credentials = service_account.Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        # ลองดึง credentials จาก environment variable ก่อน
+        credentials_json = os.getenv('GOOGLE_CREDENTIALS')
+        if credentials_json:
+            # แปลง JSON string เป็น dictionary
+            credentials_info = json.loads(credentials_json)
+            credentials = service_account.Credentials.from_service_account_info(
+                credentials_info, scopes=SCOPES)
+        else:
+            # ถ้าไม่มีใน environment variable ใช้ไฟล์ (สำหรับทดสอบในเครื่อง)
+            credentials = service_account.Credentials.from_service_account_file(
+                SERVICE_ACCOUNT_FILE, scopes=SCOPES)
         service = build('drive', 'v3', credentials=credentials)
         print("Successfully connected to Google Drive API")
         return service
@@ -139,7 +149,7 @@ def upload_combined_file(service, df):
 
 # สรุปข้อมูล
 def summarize_data(df):
-    if df.empty:
+    if df.df.empty:
         return pd.DataFrame()
     
     # เปลี่ยนรูปแบบวันที่ให้อ่านง่าย (เช่น จาก "2025-03-17" เป็น "17 Mar 2025")
@@ -234,7 +244,7 @@ def download_csv():
 
 if __name__ == '__main__':
     # สำหรับ development
-    app.run(debug=True, host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
+    app.run(debug=False, host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
 else:
     # สำหรับ production (เช่น บน Render)
     import gunicorn
