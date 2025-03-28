@@ -15,13 +15,17 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# การตั้งค่า Google Drive API จาก environment variables
+# การตั้งค่า Google Drive API
 SCOPES = ['https://www.googleapis.com/auth/drive']
 SERVICE_ACCOUNT_FILE = os.getenv('GOOGLE_CREDENTIALS_PATH', 'credentials.json')
 ROOT_FOLDER_ID = os.getenv('ROOT_FOLDER_ID', '12ZSx-p7Y-0dWp1rmVbMm5Rnh4AVEnS-A')
 CENTRAL_FOLDER_ID = os.getenv('CENTRAL_FOLDER_ID', '1Mvanpcj2-wsd2eeObHMthqVHjmqH-wCx')
 
 def get_drive_service():
+    print(f"Attempting to load credentials from: {SERVICE_ACCOUNT_FILE}")
+    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+        print(f"Credentials file not found at: {SERVICE_ACCOUNT_FILE}")
+        raise FileNotFoundError(f"Credentials file not found: {SERVICE_ACCOUNT_FILE}")
     try:
         credentials = service_account.Credentials.from_service_account_file(
             SERVICE_ACCOUNT_FILE, scopes=SCOPES)
@@ -39,14 +43,13 @@ def get_employee_data(service):
             q=f"'{ROOT_FOLDER_ID}' in parents",
             fields="files(id, name)"
         ).execute()
+        folders = results.get('files', [])
+        print(f"Found folders: {folders}")
     except Exception as e:
         print(f"Error fetching folders: {str(e)}")
         raise
     
-    folders = results.get('files', [])
-    print(f"Found folders: {folders}")
     all_data = []
-
     for folder in folders:
         if folder['name'] == 'Central':
             continue
@@ -57,12 +60,11 @@ def get_employee_data(service):
                 q=f"'{folder['id']}' in parents and mimeType='text/csv'",
                 fields="files(id, name)"
             ).execute()
+            employee_files = files.get('files', [])
+            print(f"Found files for {employee_name}: {employee_files}")
         except Exception as e:
             print(f"Error fetching files for {employee_name}: {str(e)}")
             continue
-        
-        employee_files = files.get('files', [])
-        print(f"Found files for {employee_name}: {employee_files}")
         
         for file in employee_files:
             print(f"Downloading file: {file['name']}")
@@ -73,7 +75,6 @@ def get_employee_data(service):
                 done = False
                 while not done:
                     status, done = downloader.next_chunk()
-                
                 fh.seek(0)
                 df = pd.read_csv(fh)
                 print(f"Data for {employee_name}: {df}")
@@ -89,13 +90,13 @@ def get_employee_data(service):
 
 def upload_combined_file(service, df):
     combined_file = 'combined_timesheet.csv'
+    success = False
     
     try:
         with open(combined_file, 'w', encoding='utf-8') as f:
             df.to_csv(f, index=False)
         print(f"Created temporary file: {combined_file}")
         
-        # ตรวจสอบไฟล์ที่มีอยู่
         try:
             existing_files = service.files().list(
                 q=f"'{CENTRAL_FOLDER_ID}' in parents and name='combined_timesheet.csv'",
@@ -103,25 +104,26 @@ def upload_combined_file(service, df):
             ).execute().get('files', [])
             print(f"Existing files in Central folder: {existing_files}")
         except Exception as e:
-            print(f"Error checking existing files in Central folder: {str(e)}")
-            return False  # ไม่ raise เพื่อให้ดำเนินการต่อได้
+            print(f"Error checking existing files: {str(e)}")
+            return False
         
-        # ลบไฟล์เก่าถ้ามี
         if existing_files:
             for file in existing_files:
-                print(f"Attempting to delete existing file: {file['name']} (ID: {file['id']})")
+                print(f"Attempting to delete file: {file['name']} (ID: {file['id']})")
                 try:
                     service.files().delete(fileId=file['id']).execute()
-                    print(f"Deleted existing file: {file['name']}")
+                    print(f"Deleted file: {file['name']}")
                 except HttpError as e:
                     if e.resp.status == 404:
-                        print(f"File {file['name']} (ID: {file['id']}) not found, skipping deletion")
+                        print(f"File {file['name']} not found, skipping: {str(e)}")
                     else:
                         print(f"Error deleting file {file['name']}: {str(e)}")
                         return False
+                except Exception as e:
+                    print(f"Unexpected error deleting file {file['name']}: {str(e)}")
+                    return False
         
-        # อัปโหลดไฟล์ใหม่
-        print("Creating new combined_timesheet.csv")
+        print("Uploading new combined_timesheet.csv")
         try:
             file_metadata = {
                 'name': 'combined_timesheet.csv',
@@ -130,9 +132,9 @@ def upload_combined_file(service, df):
             media = MediaFileUpload(combined_file, mimetype='text/csv')
             service.files().create(body=file_metadata, media_body=media, fields='id').execute()
             print("Successfully uploaded combined_timesheet.csv")
-            return True
+            success = True
         except Exception as e:
-            print(f"Error creating new combined_timesheet.csv: {str(e)}")
+            print(f"Error uploading combined_timesheet.csv: {str(e)}")
             return False
     except Exception as e:
         print(f"Error in upload_combined_file: {str(e)}")
@@ -143,15 +145,17 @@ def upload_combined_file(service, df):
             try:
                 if os.path.exists(combined_file):
                     os.remove(combined_file)
-                    print(f"Successfully deleted temporary file: {combined_file}")
+                    print(f"Deleted temporary file: {combined_file}")
                 break
             except Exception as e:
-                print(f"Attempt {attempt + 1}/{max_attempts} - Error deleting temporary file: {str(e)}")
+                print(f"Attempt {attempt + 1} to delete temp file failed: {str(e)}")
                 if attempt < max_attempts - 1:
                     time.sleep(1)
+    return success
 
 def summarize_data(df):
     if df.empty:
+        print("No data to summarize")
         return pd.DataFrame()
     
     df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%d %b %Y')
@@ -168,11 +172,11 @@ def summarize_data(df):
 
 @app.route('/', methods=['GET'])
 def dashboard():
+    message = "No data available"
+    table_html = "<p>No data available</p>"
     try:
         service = get_drive_service()
         raw_data = get_employee_data(service)
-        message = "No data available"
-        table_html = "<p>No data available</p>"
         
         employee_filter = request.args.get('employee', default=None)
         
@@ -183,10 +187,11 @@ def dashboard():
             
             upload_success = upload_combined_file(service, filtered_data)
             summary = summarize_data(filtered_data)
-            summary = summary[['Employee', 'Date', 'Late', 'Leave', 'WFH', 'WFO']]
-            table_html = summary.to_html(classes='table table-striped table-bordered table-hover', index=False)
-            message = "Data updated successfully" if upload_success else "Data processed but upload failed"
-            summary.to_csv('summary_for_download.csv', index=False)
+            if not summary.empty:
+                summary = summary[['Employee', 'Date', 'Late', 'Leave', 'WFH', 'WFO']]
+                table_html = summary.to_html(classes='table table-striped table-bordered table-hover', index=False)
+                message = "Data updated successfully" if upload_success else "Data processed but upload failed"
+                summary.to_csv('summary_for_download.csv', index=False)
     except Exception as e:
         table_html = f"<p>Error: {str(e)}</p>"
         message = f"Error: {str(e)}"
@@ -215,15 +220,18 @@ def download_csv():
             for attempt in range(max_attempts):
                 try:
                     os.remove('summary_for_download.csv')
-                    print(f"Successfully deleted temporary summary file: summary_for_download.csv")
+                    print(f"Deleted temporary summary file")
                     break
                 except Exception as e:
-                    print(f"Attempt {attempt + 1}/{max_attempts} - Error deleting temporary file: {str(e)}")
+                    print(f"Attempt {attempt + 1} to delete summary file failed: {str(e)}")
                     if attempt < max_attempts - 1:
                         time.sleep(1)
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
+    print(f"Starting Flask on port {port}")
     app.run(debug=False, host='0.0.0.0', port=port)
 else:
     import gunicorn
+    port = int(os.getenv('PORT', 5000))
+    print(f"Gunicorn detected, binding to port {port}")
